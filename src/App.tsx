@@ -228,7 +228,10 @@ export default function App() {
   const [dashboardDateRef, setDashboardDateRef] = useState(getHKTNow());
   const [dashboardStartDate, setDashboardStartDate] = useState('');
   const [dashboardEndDate, setDashboardEndDate] = useState('');
-  const [interestTags, setInterestTags] = useState(() => JSON.parse(localStorage.getItem('headline_tags_v1') || JSON.stringify(['白頭髮遮蓋', '想試染髮', '有機/天然品牌', '縮毛矯正', '受損髮質修護'])));
+  const [interestTags, setInterestTags] = useState(() => {
+    const defaultTags = ['白頭髮遮蓋', '想試染髮', '有機/天然品牌', '縮毛矯正', '受損髮質修護'];
+    try { const parsed = JSON.parse(localStorage.getItem('headline_tags_v1') || 'null'); return Array.isArray(parsed) ? parsed : defaultTags; } catch (e) { return defaultTags; }
+  });
   const [showRetailSection, setShowRetailSection] = useState(false);
   const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
   const [uploadAbortController, setUploadAbortController] = useState(null); 
@@ -237,7 +240,7 @@ export default function App() {
   const [rawHistoryRecords, setRawHistoryRecords] = useState(() => { 
     try { 
       const parsed = JSON.parse(localStorage.getItem('headline_salon_history_v11') || '[]'); 
-      return Array.isArray(parsed) ? parsed.map((r, i) => ({ ...r, serviceId: r.serviceId || `S-OLD-${Date.now()}-${i}` })) : []; 
+      return Array.isArray(parsed) ? parsed.filter(r => r && typeof r === 'object').map((r, i) => ({ ...r, serviceId: r.serviceId || `S-OLD-${Date.now()}-${i}` })) : []; 
     } catch(e) { return []; } 
   });
   

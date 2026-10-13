@@ -25,3 +25,11 @@ const removeNetlifyBadge = () => {
 }
 removeNetlifyBadge()
 new MutationObserver(removeNetlifyBadge).observe(document.body, { childList: true })
+
+// Show a visible message instead of a blank page if the app fails to start
+window.addEventListener('error', (e) => {
+  const root = document.getElementById('root')
+  if (root && !root.hasChildNodes()) {
+    root.textContent = 'Failed to load the app: ' + (e.message || 'unknown error')
+  }
+})
