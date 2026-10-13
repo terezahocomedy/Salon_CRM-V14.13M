@@ -86,6 +86,39 @@ const isRealId = (id) => /^C\d+$/.test(String(id || ''));
 const sameCustomerId = (a, b) => String(a || '').toUpperCase() === String(b || '').toUpperCase();
 const getRecordProfileKey = (r) => r.customerId ? String(r.customerId).toUpperCase() : getFullName(r).toLowerCase();
 const getProfileKey = (p) => p.customerId ? String(p.customerId).toUpperCase() : String(p.fullName || '').toLowerCase();
+const getMediaFiles = (record, field = 'mediaFiles') => {
+  const media = record?.[field];
+  if (field !== 'mediaFiles') {
+    return (Array.isArray(media) ? media : []).filter(Boolean).map(item => typeof item === 'string' ? { url: item, type: 'image/*' } : item)
+      .filter(item => item.url && item.url !== 'Local Image Bound');
+  }
+  const legacyLinks = record?.photoLinks;
+  const files = Array.isArray(media) && media.length ? media : (Array.isArray(legacyLinks) && legacyLinks.length ? legacyLinks : [record?.photoLink]);
+  const uniqueFiles = new Map();
+  files.filter(Boolean).map(item => typeof item === 'string' ? { url: item, type: 'image/*' } : item)
+    .filter(item => item.url && item.url !== 'Local Image Bound')
+    .forEach(item => uniqueFiles.set(item.url, item));
+  return [...uniqueFiles.values()];
+};
+const addMediaFiles = (record, files, field = 'mediaFiles') => {
+  const mediaFiles = [...getMediaFiles(record, field), ...files];
+  const updated = { ...record, [field]: mediaFiles };
+  if (field === 'mediaFiles') {
+    updated.photoLinks = mediaFiles.map(file => file.url);
+    updated.photoLink = mediaFiles[0]?.url || '';
+  }
+  return updated;
+};
+const removeMediaFile = (record, index, field = 'mediaFiles') => {
+  const mediaFiles = getMediaFiles(record, field).filter((_, i) => i !== index);
+  const updated = { ...record, [field]: mediaFiles };
+  if (field === 'mediaFiles') {
+    updated.photoLinks = mediaFiles.map(file => file.url);
+    updated.photoLink = mediaFiles[0]?.url || '';
+  }
+  return updated;
+};
+const isValidCalendarEventId = (id) => Boolean(id && !String(id).startsWith('evt_') && !['undefined', 'null'].includes(String(id)));
 const replaceReferralId = (r, oldId, newId) => {
   if (!oldId || !r.referredBy || !String(r.referredBy).trim()) return r;
   const escaped = String(oldId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -225,6 +258,19 @@ export default function App() {
 
   const getApiUrl = (baseUrl, action) => { if (!baseUrl) return ''; try { const url = new URL(baseUrl); url.searchParams.set('action', action); return url.toString(); } catch (e) { return `${baseUrl}?action=${action}`; } };
 
+  const calendarRequest = async (action, payload = {}) => {
+    if (!calendarApiUrl) throw new Error('Google Calendar API is not configured');
+    const response = await fetch(getApiUrl(calendarApiUrl, action), {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, action }),
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' }
+    });
+    if (!response.ok) throw new Error(`Calendar request failed (${response.status})`);
+    const result = await response.json();
+    if (result.status !== 'success') throw new Error(result.message || 'Calendar request was not successful');
+    return result;
+  };
+
   const updateRecordsAndSync = (updater) => {
       setRawHistoryRecords(prev => {
           const newRecords = typeof updater === 'function' ? updater(prev) : updater;
@@ -240,8 +286,44 @@ export default function App() {
   };
 
   const fetchCalendarEvents = async () => {
-    if (!calendarApiUrl) return; setIsCalendarLoading(true);
-    try { const res = await fetch(getApiUrl(calendarApiUrl, 'get_events'), { headers: { 'Content-Type': 'text/plain;charset=utf-8' }}); const data = await res.json(); if (data.status === 'success') setCalendarEvents(data.data); } catch (e) {} finally { setIsCalendarLoading(false); }
+    if (!calendarApiUrl) return null;
+    setIsCalendarLoading(true);
+    try {
+      const response = await fetch(getApiUrl(calendarApiUrl, 'get_events'), { headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
+      if (!response.ok) throw new Error(`Calendar request failed (${response.status})`);
+      const result = await response.json();
+      if (result.status !== 'success' || !Array.isArray(result.data)) throw new Error(result.message || 'Invalid calendar response');
+      const events = result.data.filter(event => event && typeof event === 'object')
+        .map(event => ({ ...event, id: event.id ?? event.eventId }));
+      setCalendarEvents(events);
+      return events;
+    } catch (e) {
+      triggerNotification('❌ Google 日曆同步失敗，請檢查連線。');
+      return null;
+    } finally {
+      setIsCalendarLoading(false);
+    }
+  };
+
+  const deleteCalendarEvent = async (eventId, stylist, quiet = false) => {
+    if (!calendarApiUrl) {
+      setCalendarEvents(prev => prev.filter(event => event.id !== eventId));
+      if (!quiet) triggerNotification('⚠️ 僅刪除本機預約；尚未設定 Google 日曆 API。');
+      return true;
+    }
+    if (!isValidCalendarEventId(eventId)) {
+      if (!quiet) triggerNotification('❌ 預約缺少有效的 Google 日曆活動編號，已保留本機預約。');
+      return false;
+    }
+    try {
+      await calendarRequest('delete_event', { eventId, stylist });
+      setCalendarEvents(prev => prev.filter(event => String(event.id) !== String(eventId)));
+      if (!quiet) triggerNotification('✅ 預約已從 Google 日曆刪除。');
+      return true;
+    } catch (error) {
+      if (!quiet) triggerNotification('❌ Google 日曆刪除失敗；本機預約已保留，請重試。');
+      return false;
+    }
   };
   
   const handleGlobalSync = async () => {
@@ -374,8 +456,11 @@ export default function App() {
     historyRecords.forEach(record => {
       const rawName = getFullName(record);
       const key = record.customerId ? String(record.customerId).toUpperCase() : rawName.toLowerCase(); 
-      if (!profiles[key]) profiles[key] = { customerId: record.customerId || '', fullName: rawName, gender: record.gender || 'Female', language: record.language || '中文', phone: record.phone || '', email: record.email || '', birthMonth: record.birthMonth || '', source: record.customerSource, totalSpent: 0, visitCount: 0, visits: [], latestFormula: '', latestVisitDate: '1970-01-01', preferences: record.notes || '', preferredStylist: record.stylist, interests: [], latestService: '', referralsMade: 0, marketingConsent: 'Opt-out', consentTimestamp: '' };
+      if (!profiles[key]) profiles[key] = { customerId: record.customerId || '', fullName: rawName, gender: record.gender || 'Female', language: record.language || '中文', phone: record.phone || '', email: record.email || '', birthMonth: record.birthMonth || '', source: record.customerSource, totalSpent: 0, visitCount: 0, visits: [], latestFormula: '', latestVisitDate: '1970-01-01', preferences: record.notes || '', preferredStylist: record.stylist, interests: [], profileMediaFiles: [], latestService: '', referralsMade: 0, marketingConsent: 'Opt-out', consentTimestamp: '' };
       const p = profiles[key];
+      (Array.isArray(record.profileMediaFiles) ? record.profileMediaFiles : []).forEach(file => {
+        if (file?.url && !p.profileMediaFiles.some(existing => existing.url === file.url)) p.profileMediaFiles.push(file);
+      });
       if (rawName && rawName !== 'Unknown') p.fullName = rawName;
       if (record.phone) p.phone = record.phone;
       if (record.marketingConsent) p.marketingConsent = record.marketingConsent;
@@ -610,20 +695,89 @@ const trafficChartData = useMemo(() => {
     return calendarEvents.some(e => { if (excludeEventId && e.id === excludeEventId) return false; if (e.stylist !== stylist) return false; const eStart = new Date(e.startTime); const eEnd = new Date(e.endTime); if (isNaN(eStart.getTime()) || isNaN(eEnd.getTime())) return false; return (start < eEnd && eStart < end); });
   };
 
-  const handleSaveCalendarEvent = async (e) => {
+  const handleSaveCalendarEvent = async (e, allowDuplicate = false) => {
     e.preventDefault();
-    if (isValidPhone(schedAddEditModal.phone)) {
-      const phoneOwner = crmProfiles.find(p => cleanPhone(p.phone) === cleanPhone(schedAddEditModal.phone) && String(p.fullName || '').trim().toLowerCase() !== String(schedAddEditModal.clientName || '').trim().toLowerCase());
-      if (phoneOwner) { playAudioFeedback('warn'); setDuplicatePhonePrompt({ ...phoneOwner, _context: 'scheduler', _sourceId: '' }); return; }
+    const appointment = schedAddEditModal;
+    if (isValidPhone(appointment.phone)) {
+      const phoneOwner = crmProfiles.find(p => cleanPhone(p.phone) === cleanPhone(appointment.phone) && String(p.fullName || '').trim().toLowerCase() !== String(appointment.clientName || '').trim().toLowerCase());
+      if (phoneOwner && !allowDuplicate) {
+        playAudioFeedback('warn');
+        setDuplicatePhonePrompt({ ...phoneOwner, _context: 'scheduler', _sourceId: '', _onContinue: () => handleSaveCalendarEvent(e, true) });
+        return;
+      }
     }
-    if (checkConflict(schedAddEditModal.stylist, schedAddEditModal.date, schedAddEditModal.time, schedAddEditModal.duration, schedAddEditModal.id)) { playAudioFeedback('warn'); triggerNotification('⚠️ 警告：該時段已有預約，將強行排入！'); }
-    const [hour, min] = schedAddEditModal.time.split(':'); const start = new Date(schedAddEditModal.date); start.setHours(parseInt(hour, 10), parseInt(min, 10), 0); const end = new Date(start.getTime() + (parseInt(schedAddEditModal.duration) || 60) * 60 * 1000);
-    const fakeId = schedAddEditModal.id || ('evt_' + Date.now());
-    const payload = { action: 'create_event', stylist: schedAddEditModal.stylist, title: `${schedAddEditModal.clientName} | ${schedAddEditModal.service}`, description: schedAddEditModal.phone ? `Phone: ${schedAddEditModal.phone}\n${schedAddEditModal.notes}` : schedAddEditModal.notes, startTime: start.toISOString(), endTime: end.toISOString() };
-    setCalendarEvents(prev => [...prev.filter(ev => ev.id !== schedAddEditModal.id), { id: fakeId, ...payload }]); setSchedAddEditModal(null); playAudioFeedback('success');
-    if (!calendarApiUrl) return triggerNotification('✅ 已本地新增預約 (未設定 API)');
-    if (schedAddEditModal.id) { try { await fetch(getApiUrl(calendarApiUrl, 'delete_event'), { method: 'POST', body: JSON.stringify({ action: 'delete_event', stylist: schedAddEditModal.oldStylist, eventId: schedAddEditModal.id }), headers: { 'Content-Type': 'text/plain;charset=utf-8' }}); } catch(err) {} }
-    try { triggerNotification('⏳ 雲端同步中...'); const res = await fetch(getApiUrl(calendarApiUrl, 'create_event'), { method: 'POST', body: JSON.stringify(payload), headers: { 'Content-Type': 'text/plain;charset=utf-8' }}); const result = await res.json(); if (result.status === 'success') { triggerNotification('✅ 預約已同步至 Google 日曆！'); fetchCalendarEvents(); } } catch(err) { triggerNotification('❌ 同步失敗'); }
+    const hasConflict = checkConflict(appointment.stylist, appointment.date, appointment.time, appointment.duration, appointment.id);
+    if (hasConflict && !allowDuplicate) {
+      playAudioFeedback('warn');
+      setConfirmDialog({
+        title: '確認重疊預約',
+        message: '該設計師在此時段已有預約。仍要建立這筆預約嗎？',
+        onConfirm: () => handleSaveCalendarEvent(e, true)
+      });
+      return;
+    }
+    const [hour, min] = appointment.time.split(':');
+    const start = new Date(appointment.date);
+    start.setHours(parseInt(hour, 10), parseInt(min, 10), 0);
+    const end = new Date(start.getTime() + (parseInt(appointment.duration, 10) || 60) * 60000);
+    const payload = {
+      stylist: appointment.stylist,
+      title: `${appointment.clientName} | ${appointment.service}`,
+      description: appointment.phone ? `Phone: ${appointment.phone}\n${appointment.notes}` : appointment.notes,
+      startTime: start.toISOString(),
+      endTime: end.toISOString()
+    };
+
+    if (!calendarApiUrl) {
+      const localEvent = { id: appointment.id || `evt_${Date.now()}`, ...payload };
+      setCalendarEvents(prev => [...prev.filter(event => event.id !== appointment.id), localEvent]);
+      setSchedAddEditModal(null);
+      playAudioFeedback('success');
+      triggerNotification('✅ 已本地新增預約 (未設定 API)');
+      return;
+    }
+    if (appointment.id && !isValidCalendarEventId(appointment.id)) {
+      triggerNotification('❌ 預約缺少有效的 Google 日曆活動編號，已保留原預約。');
+      return;
+    }
+
+    try {
+      triggerNotification('⏳ 雲端同步中...');
+      const result = await calendarRequest('create_event', payload);
+      let createdEventId = result.eventId || result.id || result.data?.eventId || result.data?.id;
+      if (!createdEventId) {
+        const remoteEvents = await fetchCalendarEvents();
+        const matchingEvent = remoteEvents?.find(event =>
+          String(event.id) !== String(appointment.id) &&
+          cleanStylistName(event.stylist) === appointment.stylist &&
+          event.title === payload.title &&
+          new Date(event.startTime).getTime() === start.getTime()
+        );
+        createdEventId = matchingEvent?.id;
+      }
+      if (!createdEventId) throw new Error('Google Calendar did not return an event ID');
+
+      if (appointment.id) {
+        try {
+          await calendarRequest('delete_event', { eventId: appointment.id, stylist: appointment.oldStylist || appointment.stylist });
+        } catch (deleteError) {
+          try {
+            await calendarRequest('delete_event', { eventId: createdEventId, stylist: appointment.stylist });
+          } catch (rollbackError) {
+            await fetchCalendarEvents();
+          }
+          throw new Error('Could not remove the previous appointment; the update was rolled back where possible.');
+        }
+      }
+
+      setCalendarEvents(prev => [...prev.filter(event => String(event.id) !== String(appointment.id)), { id: createdEventId, ...payload }]);
+      setSchedAddEditModal(null);
+      playAudioFeedback('success');
+      triggerNotification('✅ 預約已同步至 Google 日曆！');
+      fetchCalendarEvents();
+    } catch (error) {
+      triggerNotification(`❌ 預約同步失敗：${error.message || '請檢查連線後重試。'}`);
+    }
   };
 
   const handlePeriodChange = (offset) => { playAudioFeedback('click'); if (dashboardPeriod === 'custom') return; const d = new Date(dashboardDateRef); if (dashboardPeriod === 'day') d.setDate(d.getDate() + offset); if (dashboardPeriod === 'week') d.setDate(d.getDate() + (offset * 7)); if (dashboardPeriod === 'month') d.setMonth(d.getMonth() + offset); if (dashboardPeriod === 'year') d.setFullYear(d.getFullYear() + offset); setDashboardDateRef(d); };
@@ -652,85 +806,81 @@ const trafficChartData = useMemo(() => {
     }
   };
 
-  const capturePhoto = async () => {
+  const uploadMediaFiles = async (selectedFiles, onUploaded, filenamePrefix) => {
+    const files = Array.from(selectedFiles || []).filter(file => /^(image|video)\//i.test(file.type));
+    if (!files.length) return;
+    const controller = new AbortController();
+    setUploadAbortController(controller);
+    setIsUploadingPhoto(true);
+    const uploadedFiles = [];
     try {
-        const input = document.createElement('input'); input.type = 'file'; input.accept = 'image/*'; 
-        input.onchange = (e) => {
-            const file = (e.target).files[0]; if(!file) return; setIsUploadingPhoto(true); const reader = new FileReader();
-            reader.onload = async (event) => {
-                const base64Data = (event.target.result).split(',')[1];
-                if (!driveApiUrl) { setFormData(prev => ({...prev, photoLink: 'Local Image Bound'})); setIsUploadingPhoto(false); return triggerNotification('✅ 圖片已暫存 (未設定 API)'); }
-                
-                const controller = new AbortController();
-                setUploadAbortController(controller);
-
-                try {
-                    const dynamicId = formData.clientType === 'New' || !formData.customerId ? 'NewClient' : formData.customerId;
-                    const fName = formData.firstName || 'Unknown';
-                    const currentServiceId = formData.serviceId || generateServiceId(formData.date, safeRawRecords);
-                    const filename = `${dynamicId}_${fName}_${currentServiceId}.jpg`;
-                    
-                    const res = await fetch(driveApiUrl, { 
-                        method: 'POST', 
-                        body: JSON.stringify({ action: 'upload_photo', filename: filename, mimeType: file.type, data: base64Data }), 
-                        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                        signal: controller.signal
-                    });
-                    const result = await res.json();
-                    if(result.status === 'success') { setFormData(prev => ({...prev, photoLink: result.url, serviceId: currentServiceId})); triggerNotification('✅ 照片已成功上傳至雲端！'); }
-                } catch(err) { 
-                    if (err.name === 'AbortError') {
-                        console.log('Upload aborted by user');
-                    } else {
-                        triggerNotification('❌ 照片上傳失敗'); 
-                    }
-                } finally {
-                    setIsUploadingPhoto(false);
-                    setUploadAbortController(null);
-                }
-            }; reader.readAsDataURL(file);
-        }; input.click();
-    } catch(e) { triggerNotification('❌ 無法啟動相簿/相機'); }
+      for (const [index, file] of files.entries()) {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(new Error('Unable to read selected media'));
+          reader.readAsDataURL(file);
+        });
+        let url = dataUrl;
+        if (driveApiUrl) {
+          const safeFileName = file.name.replace(/[^\w.-]/g, '_');
+          const response = await fetch(driveApiUrl, {
+            method: 'POST',
+            body: JSON.stringify({
+              action: 'upload_photo',
+              filename: `${String(filenamePrefix).replace(/[^\w.-]/g, '_')}_${Date.now()}_${index}_${safeFileName}`,
+              mimeType: file.type,
+              data: String(dataUrl).split(',')[1]
+            }),
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            signal: controller.signal
+          });
+          if (!response.ok) throw new Error(`Upload failed (${response.status})`);
+          const result = await response.json();
+          if (result.status !== 'success' || !result.url) throw new Error(result.message || 'Upload did not return a media URL');
+          url = result.url;
+        }
+        uploadedFiles.push({ url, type: file.type, name: file.name });
+      }
+      onUploaded(uploadedFiles);
+      triggerNotification(driveApiUrl ? '✅ 媒體已成功上傳至雲端！' : '✅ 媒體已儲存於本機。');
+    } catch (error) {
+      if (uploadedFiles.length) onUploaded(uploadedFiles);
+      triggerNotification(error.name === 'AbortError' ? '⚠️ 已取消上傳。' : `❌ 媒體上傳失敗：${error.message || ''}`);
+    } finally {
+      setIsUploadingPhoto(false);
+      setUploadAbortController(null);
+    }
   };
 
-  const capturePhotoForEdit = async () => {
+  const chooseMediaFiles = (onUploaded, filenamePrefix) => {
     try {
-        const input = document.createElement('input'); input.type = 'file'; input.accept = 'image/*';
-        input.onchange = (e) => {
-            const file = (e.target).files[0]; if(!file) return; setIsUploadingPhoto(true); const reader = new FileReader();
-            reader.onload = async (event) => {
-                const base64Data = (event.target.result).split(',')[1];
-                if (!driveApiUrl) { setEditModal(prev => ({...prev, photoLink: 'Local Image Bound'})); setIsUploadingPhoto(false); return triggerNotification('✅ 圖片已暫存 (未設定 API)'); }
-                
-                const controller = new AbortController();
-                setUploadAbortController(controller);
-
-                try {
-                    const filename = `${editModal.customerId}_${editModal.firstName}_${editModal.serviceId}_update.jpg`;
-                    const res = await fetch(driveApiUrl, { 
-                        method: 'POST', 
-                        body: JSON.stringify({ action: 'upload_photo', filename: filename, mimeType: file.type, data: base64Data }), 
-                        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                        signal: controller.signal
-                    });
-                    const result = await res.json();
-                    if(result.status === 'success') { setEditModal(prev => ({...prev, photoLink: result.url})); triggerNotification('✅ 照片已更新！'); }
-                } catch(err) { 
-                    if (err.name === 'AbortError') {
-                        console.log('Upload aborted by user');
-                    } else {
-                        triggerNotification('❌ 照片上傳失敗'); 
-                    }
-                } finally {
-                    setIsUploadingPhoto(false);
-                    setUploadAbortController(null);
-                }
-            }; reader.readAsDataURL(file);
-        }; input.click();
-    } catch(e) { triggerNotification('❌ 無法選擇照片'); }
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*,video/*';
+      input.multiple = true;
+      input.onchange = event => uploadMediaFiles(event.target.files, onUploaded, filenamePrefix);
+      input.click();
+    } catch (error) {
+      triggerNotification('❌ 無法啟動相簿/相機');
+    }
   };
 
-  const handleSubmitCheckout = (e) => {
+  const capturePhoto = () => {
+    const customerId = formData.clientType === 'New' || !formData.customerId ? 'NewClient' : formData.customerId;
+    const serviceId = formData.serviceId || generateServiceId(formData.date, safeRawRecords);
+    chooseMediaFiles(files => setFormData(prev => ({ ...addMediaFiles(prev, files), serviceId })), `${customerId}_${formData.firstName || 'Unknown'}_${serviceId}`);
+  };
+
+  const capturePhotoForEdit = () => {
+    chooseMediaFiles(files => setEditModal(prev => addMediaFiles(prev, files)), `${editModal.customerId}_${editModal.firstName}_${editModal.serviceId}_update`);
+  };
+
+  const captureProfileMedia = () => {
+    chooseMediaFiles(files => setProfileEditData(prev => addMediaFiles(prev, files, 'profileMediaFiles')), `${profileEditData.customerId}_${profileEditData.fullName}_profile`);
+  };
+
+  const handleSubmitCheckout = (e, allowDuplicate = false) => {
     e.preventDefault(); 
     if (!formData.firstName) return triggerNotification('請輸入顧客姓名！'); 
     if (!formData.price || parseInt(formData.price) <= 0) return triggerNotification('請輸入有效金額！');
@@ -739,13 +889,31 @@ const trafficChartData = useMemo(() => {
     const finalCustomerId = getCheckoutCustomerId(formData, rawHistoryRecords);
     const currentCustomerId = formData.clientType === 'New' || !formData.customerId ? '' : formData.customerId;
     const cleanInputPhone = cleanPhone(formData.phone);
-    if (cleanInputPhone.length >= PHONE_MIN_LENGTH) {
+    if (cleanInputPhone.length >= PHONE_MIN_LENGTH && !allowDuplicate) {
         const existingPhone = crmProfiles.find(p => cleanPhone(p.phone) === cleanInputPhone && !sameCustomerId(p.customerId, currentCustomerId));
         if (existingPhone) {
             playAudioFeedback('warn');
-            setDuplicatePhonePrompt({ ...existingPhone, _context: 'checkout', _sourceId: currentCustomerId });
+            setDuplicatePhonePrompt({ ...existingPhone, _context: 'checkout', _sourceId: currentCustomerId, _onContinue: () => handleSubmitCheckout(e, true) });
             return;
         }
+    }
+    const normalizedName = String(formData.firstName || '').trim().toLowerCase();
+    const normalizedEmail = String(formData.email || '').trim().toLowerCase();
+    const duplicateProfile = !allowDuplicate && crmProfiles.find(profile =>
+      !sameCustomerId(profile.customerId, currentCustomerId) &&
+      normalizedName &&
+      normalizedName === String(profile.fullName || '').trim().toLowerCase() &&
+      ((cleanInputPhone.length >= PHONE_MIN_LENGTH && cleanPhone(profile.phone) === cleanInputPhone) ||
+        (normalizedEmail && normalizedEmail === String(profile.email || '').trim().toLowerCase()))
+    );
+    if (duplicateProfile) {
+      playAudioFeedback('warn');
+      setConfirmDialog({
+        title: '確認可能重複客戶',
+        message: `已找到相同姓名及聯絡資料的客戶「${duplicateProfile.fullName}」(${duplicateProfile.customerId})。仍要建立新紀錄嗎？`,
+        onConfirm: () => handleSubmitCheckout(e, true)
+      });
+      return;
     }
     const upgradeFromId = isTempId(currentCustomerId) && finalCustomerId !== currentCustomerId ? currentCustomerId : '';
 
@@ -757,11 +925,11 @@ const trafficChartData = useMemo(() => {
     
     const finalRecord = { ...formData, firstName: formData.firstName.trim(), lastName: '', name: formData.firstName.trim(), customerId: finalCustomerId, serviceId: currentServiceId, customerSource: formData.clientType === 'New' ? `新客 (${formData.sourceDetail})` : (formData.clientType === 'Repeated' && !formData.customerId ? '舊客 (數位首建)' : '舊客 (Repeated)'), services: [...formattedSelectedServices, formattedCustomService].filter(Boolean).join(', '), interests: formData.interests.join(', '), isProfileOnly: false, timestamp: getHKTNow().toISOString() };
 
-    setTimeout(() => {
+    setTimeout(async () => {
       if (upgradeFromId) updateRecordsAndSync(prev => [finalRecord, ...prev.map(r => sameCustomerId(r.customerId, upgradeFromId) ? { ...r, customerId: finalCustomerId } : replaceReferralId(r, upgradeFromId, finalCustomerId))]);
       else setRawHistoryRecords(prev => [finalRecord, ...prev]);
       if (!upgradeFromId && driveApiUrl) fetch(getApiUrl(driveApiUrl, 'append'), { method: 'POST', body: JSON.stringify({ action: 'append', record: finalRecord }), headers: { 'Content-Type': 'text/plain;charset=utf-8' } }).catch(()=>{});
-      if (formData._eventId && calendarApiUrl) fetch(getApiUrl(calendarApiUrl, 'delete_event'), { method: 'POST', body: JSON.stringify({ action: 'delete_event', eventId: formData._eventId }), headers: { 'Content-Type': 'text/plain;charset=utf-8' } }).catch(()=>{});
+      if (formData._eventId) await deleteCalendarEvent(formData._eventId, formData._stylist);
       setSubmitting(false); playAudioFeedback('cashier'); setShowSuccessModal(true); setFormData(getInitialForm());
     }, 400); 
   };
@@ -1280,14 +1448,24 @@ const trafficChartData = useMemo(() => {
                       <div className="mt-auto pt-3 md:pt-4 border-t border-[#E8DCC8] flex gap-2">
                           <button type="button" onClick={capturePhoto} className={`flex-1 py-3 md:py-4 rounded-2xl font-black shadow-sm flex items-center justify-center gap-2 transition-all text-sm md:text-lg ${isUploadingPhoto ? 'bg-gray-100 text-gray-400 border border-gray-200 cursor-not-allowed' : 'bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-200'}`} disabled={isUploadingPhoto}>
                               {isUploadingPhoto ? <Icons.Refresh className="animate-spin inline-block w-5 h-5 md:w-6 md:h-6" /> : <Icons.Photo className="w-5 h-5 md:w-6 md:h-6" />} 
-                              <span>{isUploadingPhoto ? '上傳中 (Uploading)...' : formData.photoLink ? '✅ 已綁定照片 (Photo Bound)' : '📷 拍照上傳 (Take Photo)'}</span>
+                              <span>{isUploadingPhoto ? '上傳中 (Uploading)...' : getMediaFiles(formData).length ? `✅ 已加入媒體 (${getMediaFiles(formData).length})` : '📷 加入照片/影片 (Add Media)'}</span>
                           </button>
                           {isUploadingPhoto && (
-                              <button type="button" onClick={() => { if(uploadAbortController) uploadAbortController.abort(); setIsUploadingPhoto(false); triggerNotification('⚠️ 已取消上傳 (Upload Aborted)'); }} className="px-4 py-3 md:px-6 md:py-4 rounded-2xl font-black text-red-500 bg-red-50 hover:bg-red-100 border border-red-200 transition-all shadow-sm text-sm md:text-base">
+                              <button type="button" onClick={() => { uploadAbortController?.abort(); triggerNotification('⚠️ 正在取消上傳...'); }} className="px-4 py-3 md:px-6 md:py-4 rounded-2xl font-black text-red-500 bg-red-50 hover:bg-red-100 border border-red-200 transition-all shadow-sm text-sm md:text-base">
                                   取消 (Abort)
                               </button>
                           )}
                       </div>
+                      {getMediaFiles(formData).length > 0 && (
+                        <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-2">
+                          {getMediaFiles(formData).map((file, index) => (
+                            <div key={`${file.url}-${index}`} className="relative">
+                              {file.type?.startsWith('video/') ? <video src={file.url} controls className="w-full h-24 object-cover rounded-lg" /> : <img src={file.url} alt={file.name || `Media ${index + 1}`} className="w-full h-24 object-cover rounded-lg" />}
+                              <button type="button" onClick={() => setFormData(prev => removeMediaFile(prev, index))} className="absolute top-1 right-1 bg-red-600 text-white rounded-full px-2 py-0.5 text-xs font-bold">移除</button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                    </div>
 
                    <button type="submit" disabled={submitting || isUploadingPhoto} className={`w-full text-white font-black py-4 md:py-6 rounded-3xl text-xl md:text-3xl shadow-lg transition-all flex items-center justify-center space-x-2 md:space-x-3 mt-auto ${isUploadingPhoto || submitting ? 'opacity-50 cursor-not-allowed' : 'hover:opacity-90 hover:scale-[1.02]'}`} style={{ backgroundColor: activeTheme.hex, boxShadow: `0 10px 25px -5px ${activeTheme.shadow}` }}>
@@ -1361,6 +1539,13 @@ const trafficChartData = useMemo(() => {
                                 {client.phone && <div className="flex items-center gap-1"><span>📞 {client.phone}</span><a href={getWaLink(client.phone)} target="_blank" rel="noopener noreferrer" className="text-emerald-500 hover:text-emerald-600 ml-1"><Icons.MessageCircle /></a></div>}
                                 <span className="bg-gray-100 px-1.5 py-0.5 rounded text-[10px] md:text-xs">{client.language}</span>
                             </div>
+                            {client.profileMediaFiles?.length > 0 && (
+                              <div className="mt-3 grid grid-cols-3 gap-2">
+                                {client.profileMediaFiles.map((file, index) => file.type?.startsWith('video/')
+                                  ? <video key={`${file.url}-${index}`} src={file.url} controls className="w-full h-16 object-cover rounded-lg" />
+                                  : <img key={`${file.url}-${index}`} src={file.url} alt={file.name || 'Customer media'} className="w-full h-16 object-cover rounded-lg" />)}
+                              </div>
+                            )}
                         </div>
                         <div className="grid grid-cols-2 gap-2 md:gap-4 text-base md:text-lg bg-[#F6EFE9]/50 p-3 md:p-5 rounded-xl md:rounded-2xl mb-3 md:mb-4 border border-[#E8DCC8]">
                           <div><span className="text-[10px] md:text-sm text-gray-500 uppercase font-bold block mb-0.5 md:mb-1">LTV (總消費)</span><span className="font-black text-[#4A2511] text-lg md:text-2xl">${client.totalSpent.toLocaleString()}</span></div>
@@ -1383,11 +1568,7 @@ const trafficChartData = useMemo(() => {
                                 <p className="text-gray-600 font-bold text-xs md:text-sm mb-1 leading-tight">{v.services}</p>
                                 {v.formula && <p className="font-mono text-[10px] md:text-xs text-gray-700 bg-gray-50 p-1.5 md:p-2 rounded-lg border border-gray-100 break-words whitespace-pre-wrap">{v.formula}</p>}
                                 
-                                {v.photoLink && v.photoLink !== 'Local Image Bound' && (
-                                  <a href={v.photoLink} target="_blank" rel="noreferrer" className="mt-1.5 md:mt-2 inline-flex items-center gap-1 md:gap-1.5 px-2 py-1 md:px-3 md:py-1.5 bg-blue-50 text-blue-600 border border-blue-200 font-bold rounded-md md:rounded-lg text-[10px] md:text-xs hover:bg-blue-100 transition-colors shadow-sm self-start">
-                                    <Icons.Photo className="w-3 h-3 md:w-4 md:h-4" /> <span>查看照片</span>
-                                  </a>
-                                )}
+                                {getMediaFiles(v).length > 0 && <div className="mt-2 grid grid-cols-3 gap-1.5">{getMediaFiles(v).map((file, index) => <a key={`${file.url}-${index}`} href={file.url} target="_blank" rel="noreferrer" className="block">{file.type?.startsWith('video/') ? <video src={file.url} className="w-full h-14 object-cover rounded-md" /> : <img src={file.url} alt={file.name || `Media ${index + 1}`} className="w-full h-14 object-cover rounded-md" />}</a>)}</div>}
   
                                 <div className="absolute top-1.5 right-1.5 md:top-2 md:right-2 flex space-x-1 md:opacity-0 group-hover/record:opacity-100 transition-opacity">
                                    <button onClick={() => setEditModal({...v, firstName: client.fullName, customerId: client.customerId})} className="p-1 md:p-1.5 bg-gray-100 hover:text-blue-600 text-gray-500 rounded-md md:rounded-lg"><Icons.Edit /></button>
@@ -1457,11 +1638,7 @@ const trafficChartData = useMemo(() => {
                                               <p className="text-gray-600 font-bold text-xs md:text-sm mb-1 leading-tight">{v.services}</p>
                                               {v.formula && <p className="font-mono text-[10px] md:text-xs text-gray-700 bg-gray-50 p-1.5 md:p-2 rounded-lg border border-gray-100 break-words whitespace-pre-wrap">{v.formula}</p>}
                                               
-                                              {v.photoLink && v.photoLink !== 'Local Image Bound' && (
-                                                <a href={v.photoLink} target="_blank" rel="noreferrer" className="mt-1.5 md:mt-2 inline-flex items-center gap-1 md:gap-1.5 px-2 py-1 md:px-3 md:py-1.5 bg-blue-50 text-blue-600 font-bold border border-blue-200 rounded-md md:rounded-lg text-[10px] md:text-xs hover:bg-blue-100 transition-colors shadow-sm self-start">
-                                                  <Icons.Photo className="w-3 h-3 md:w-4 md:h-4" /> <span>查看照片</span>
-                                                </a>
-                                              )}
+                                              {getMediaFiles(v).length > 0 && <div className="mt-2 grid grid-cols-3 gap-1.5">{getMediaFiles(v).map((file, index) => <a key={`${file.url}-${index}`} href={file.url} target="_blank" rel="noreferrer" className="block">{file.type?.startsWith('video/') ? <video src={file.url} className="w-full h-14 object-cover rounded-md" /> : <img src={file.url} alt={file.name || `Media ${index + 1}`} className="w-full h-14 object-cover rounded-md" />}</a>)}</div>}
                 
                                               <div className="absolute top-1.5 right-1.5 md:top-2 md:right-2 flex space-x-1 opacity-100 sm:opacity-0 group-hover/record:opacity-100 transition-opacity">
                                                  <button onClick={() => setEditModal({...v, firstName: client.fullName, customerId: client.customerId})} className="p-1.5 bg-gray-100 hover:text-blue-600 text-gray-500 rounded-md md:rounded-lg"><Icons.Edit /></button>
@@ -1813,6 +1990,7 @@ const trafficChartData = useMemo(() => {
                    else handleSelectSuggest(existing);
                    setDuplicatePhonePrompt(null);
                }} className="w-full py-3 md:py-3.5 rounded-xl font-black bg-[#8B5A2B] text-white shadow-md hover:bg-[#6D3A14] transition-colors text-sm md:text-base">載入舊顧客資料 (Load Profile)</button>
+               {duplicatePhonePrompt._onContinue && <button onClick={() => { const continueSave = duplicatePhonePrompt._onContinue; setDuplicatePhonePrompt(null); continueSave(); }} className="w-full py-3 md:py-3.5 rounded-xl font-black bg-amber-100 text-amber-800 hover:bg-amber-200 transition-colors text-sm md:text-base">仍要繼續 (Continue Anyway)</button>}
                {(() => {
                    const existing = duplicatePhonePrompt;
                    const source = existing._sourceId ? crmProfiles.find(p => sameCustomerId(p.customerId, existing._sourceId)) : null;
@@ -1827,6 +2005,7 @@ const trafficChartData = useMemo(() => {
                    }} className="w-full py-3 md:py-3.5 rounded-xl font-black bg-amber-100 text-amber-800 hover:bg-amber-200 transition-colors text-sm md:text-base">合併兩個檔案 (Merge)</button>;
                })()}
                <button onClick={() => { const ctx = duplicatePhonePrompt._context; if (ctx === 'profile') setProfileEditData(prev => ({ ...prev, phone: '' })); else if (ctx === 'scheduler') setSchedAddEditModal(prev => ({ ...prev, phone: '' })); else setFormData(prev => ({...prev, phone: ''})); setDuplicatePhonePrompt(null); }} className="w-full py-3 md:py-3.5 rounded-xl font-bold bg-gray-100 text-gray-600 hover:bg-gray-200 transition-colors text-sm md:text-base">清除號碼，重新輸入 (Clear)</button>
+               <button onClick={() => setDuplicatePhonePrompt(null)} className="w-full py-3 md:py-3.5 rounded-xl font-bold text-gray-500 hover:bg-gray-50 transition-colors text-sm md:text-base">取消 (Cancel)</button>
             </div>
           </div>
         </div>
@@ -1974,12 +2153,12 @@ const trafficChartData = useMemo(() => {
                 <div className="flex flex-col gap-2 md:gap-3">
                     <button onClick={() => {
                         const existingClient = crmProfiles.find(p => p.fullName === schedDetailModal.clientName || (p.phone && p.phone === schedDetailModal.phone));
-                        if (existingClient) { handleSelectSuggest(existingClient); setFormData(prev => ({ ...prev, stylist: schedDetailModal.stylist, notes: `預約服務: ${schedDetailModal.service}\n${schedDetailModal.notes}`, _eventId: schedDetailModal.id, _stylist: schedDetailModal.stylist })); } else { setFormData({ ...getInitialForm(), firstName: schedDetailModal.clientName, stylist: schedDetailModal.stylist, phone: schedDetailModal.phone || '', notes: `預約服務: ${schedDetailModal.service}\n${schedDetailModal.notes}`, _eventId: schedDetailModal.id, _stylist: schedDetailModal.stylist }); }
+                        if (existingClient) { handleSelectSuggest(existingClient); setFormData(prev => ({ ...prev, stylist: schedDetailModal.stylist, phone: schedDetailModal.phone || existingClient.phone || '', notes: `預約服務: ${schedDetailModal.service}\n${schedDetailModal.notes}`, _eventId: schedDetailModal.id, _stylist: schedDetailModal.stylist })); } else { setFormData({ ...getInitialForm(), firstName: schedDetailModal.clientName, stylist: schedDetailModal.stylist, phone: schedDetailModal.phone || '', notes: `預約服務: ${schedDetailModal.service}\n${schedDetailModal.notes}`, _eventId: schedDetailModal.id, _stylist: schedDetailModal.stylist }); }
                         setSchedDetailModal(null); setActiveTab('checkout');
                     }} className="w-full bg-[#4A2511] text-white font-black py-3 md:py-4 rounded-xl shadow-lg flex items-center justify-center gap-2 hover:opacity-90 text-sm md:text-base"><Icons.Gift className="w-4 h-4 md:w-5 md:h-5"/> <span>立即結帳 (Checkout)</span></button>
                     <div className="flex gap-2 md:gap-3">
                         <button onClick={() => { setSchedAddEditModal({...schedDetailModal, oldStylist: schedDetailModal.stylist}); setSchedDetailModal(null); }} className="flex-1 bg-gray-100 text-gray-700 font-bold py-2.5 md:py-3 rounded-xl hover:bg-gray-200 text-sm md:text-base">修改</button>
-                        <button onClick={() => setConfirmDialog({ title: '刪除預約', message: `確定刪除 ${schedDetailModal.clientName} 的預約嗎？`, onConfirm: async () => { setCalendarEvents(prev => prev.filter(ev => ev.id !== schedDetailModal.id)); setSchedDetailModal(null); if (calendarApiUrl) fetch(getApiUrl(calendarApiUrl, 'delete_event'), { method: 'POST', body: JSON.stringify({ action: 'delete_event', stylist: schedDetailModal.stylist, eventId: schedDetailModal.id }), headers: { 'Content-Type': 'text/plain;charset=utf-8' }}); triggerNotification('✅ 已刪除預約'); } })} className="flex-1 bg-red-50 text-red-600 font-bold py-2.5 md:py-3 rounded-xl hover:bg-red-100 border border-red-100 text-sm md:text-base">刪除</button>
+                        <button onClick={() => setConfirmDialog({ title: '刪除預約', message: `確定刪除 ${schedDetailModal.clientName} 的預約嗎？`, onConfirm: async () => { if (await deleteCalendarEvent(schedDetailModal.id, schedDetailModal.stylist)) setSchedDetailModal(null); } })} className="flex-1 bg-red-50 text-red-600 font-bold py-2.5 md:py-3 rounded-xl hover:bg-red-100 border border-red-100 text-sm md:text-base">刪除</button>
                     </div>
                 </div>
             </div>
@@ -2005,7 +2184,7 @@ const trafficChartData = useMemo(() => {
 
       {editModal && (
         <div className="fixed inset-0 bg-[#4A2511]/60 backdrop-blur-sm flex items-center justify-center z-[100] p-4">
-          <form onSubmit={(e) => {
+          <form id="profile-edit-form" onSubmit={(e) => {
             e.preventDefault(); 
             if (isUploadingPhoto) { playAudioFeedback('warn'); return triggerNotification('⏳ 圖片上傳中，請稍候再儲存或先取消上傳！'); }
             const updatedRecord = { ...editModal };
@@ -2021,28 +2200,19 @@ const trafficChartData = useMemo(() => {
               <div className="sm:col-span-2"><label className="block text-[10px] md:text-xs font-bold mb-1 text-gray-500">配方</label><textarea rows={3} value={editModal.formula||''} onChange={e=>setEditModal({...editModal, formula: e.target.value})} className="w-full bg-[#F6EFE9] rounded-xl py-2.5 md:py-3 px-3 font-bold outline-none focus:bg-white border font-mono text-xs md:text-sm" /></div>
               
               <div className="sm:col-span-2">
-                 <label className="block text-[10px] md:text-xs font-bold mb-1 text-gray-500">照片 (Photo)</label>
-                 <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 md:gap-3">
-                     {editModal.photoLink && editModal.photoLink !== 'Local Image Bound' ? (
-                        <div className="flex items-center gap-2 bg-gray-50 px-3 py-2 rounded-xl border border-gray-200 w-full sm:w-auto">
-                           <a href={editModal.photoLink} target="_blank" rel="noreferrer" className="text-blue-600 font-bold text-xs md:text-sm underline flex items-center gap-1"><Icons.Photo className="w-4 h-4" /> 查看現有照片</a>
-                           <button type="button" onClick={() => setEditModal({...editModal, photoLink: ''})} className="text-red-500 text-[10px] md:text-xs font-bold px-2 py-1 hover:bg-red-50 rounded ml-auto sm:ml-2 transition-colors">移除 (Remove)</button>
-                        </div>
-                     ) : (
-                         isUploadingPhoto ? (
-                             <div className="flex gap-2 w-full sm:w-auto">
-                                <button type="button" disabled className="flex-1 sm:flex-none text-xs md:text-sm font-bold py-2 md:py-2.5 px-3 md:px-4 rounded-xl flex justify-center items-center gap-1 md:gap-2 transition-colors border bg-gray-100 text-gray-400 border-gray-200">
-                                   <Icons.Refresh className="animate-spin w-4 h-4" /> 上傳中...
-                                </button>
-                                <button type="button" onClick={() => { if(uploadAbortController) uploadAbortController.abort(); setIsUploadingPhoto(false); triggerNotification('⚠️ 已取消上傳 (Upload Aborted)'); }} className="flex-1 sm:flex-none text-xs md:text-sm font-bold py-2 md:py-2.5 px-3 md:px-4 rounded-xl text-red-500 bg-red-50 border border-red-200 hover:bg-red-100">取消 (Abort)</button>
-                             </div>
-                         ) : (
-                             <button type="button" onClick={capturePhotoForEdit} className="w-full sm:w-auto text-xs md:text-sm font-bold py-2 md:py-2.5 px-3 md:px-4 rounded-xl flex justify-center items-center gap-1 md:gap-2 transition-colors border bg-blue-50 hover:bg-blue-100 text-blue-600 border-blue-200">
-                               <Icons.Photo className="w-4 h-4" /> 新增/更改照片 (Add/Change)
-                             </button>
-                         )
-                     )}
-                 </div>
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <label className="text-[10px] md:text-xs font-bold text-gray-500">照片/影片 (Media)</label>
+                  <button type="button" disabled={isUploadingPhoto} onClick={capturePhotoForEdit} className="px-3 py-2 rounded-lg bg-blue-50 text-blue-600 font-bold text-xs disabled:opacity-50">{isUploadingPhoto ? '上傳中...' : '+ 加入媒體'}</button>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {getMediaFiles(editModal).map((file, index) => (
+                    <div key={`${file.url}-${index}`} className="relative">
+                      {file.type?.startsWith('video/') ? <video src={file.url} controls className="w-full h-24 object-cover rounded-lg" /> : <img src={file.url} alt={file.name || `Media ${index + 1}`} className="w-full h-24 object-cover rounded-lg" />}
+                      <button type="button" onClick={() => setEditModal(prev => removeMediaFile(prev, index))} className="absolute top-1 right-1 bg-red-600 text-white rounded-full px-2 py-0.5 text-xs font-bold">移除</button>
+                    </div>
+                  ))}
+                </div>
+                {isUploadingPhoto && <button type="button" onClick={() => uploadAbortController?.abort()} className="mt-2 px-3 py-2 rounded-lg text-red-600 bg-red-50 font-bold text-xs">取消上傳</button>}
               </div>
 
             </div>
@@ -2060,9 +2230,38 @@ const trafficChartData = useMemo(() => {
 
             const newPhone = (e.target as any).phone.value;
             const newStylist = (e.target as any).stylist.value;
-            if (isValidPhone(newPhone)) {
+            if (isValidPhone(newPhone) && !profileEditData._allowDuplicatePhone) {
                 const phoneOwner = crmProfiles.find(p => cleanPhone(p.phone) === cleanPhone(newPhone) && !sameCustomerId(p.customerId, profileEditData.customerId));
-                if (phoneOwner) { playAudioFeedback('warn'); setDuplicatePhonePrompt({ ...phoneOwner, _context: 'profile', _sourceId: profileEditData.customerId }); return; }
+                if (phoneOwner) {
+                  playAudioFeedback('warn');
+                  setDuplicatePhonePrompt({
+                    ...phoneOwner,
+                    _context: 'profile',
+                    _sourceId: profileEditData.customerId,
+                    _onContinue: () => {
+                      setProfileEditData(prev => ({ ...prev, _allowDuplicatePhone: true, _allowDuplicateEntries: true }));
+                      setTimeout(() => document.getElementById('profile-edit-form')?.requestSubmit(), 0);
+                    }
+                  });
+                  return;
+                }
+            }
+            const matchingCustomer = crmProfiles.find(profile =>
+              !sameCustomerId(profile.customerId, profileEditData.customerId) &&
+              newFullName.toLowerCase() === String(profile.fullName || '').trim().toLowerCase() &&
+              ((isValidPhone(newPhone) && cleanPhone(newPhone) === cleanPhone(profile.phone)) ||
+                (profileEditData.email && String(profile.email || '').trim().toLowerCase() === String(profileEditData.email).trim().toLowerCase()))
+            );
+            if (matchingCustomer && !profileEditData._allowDuplicateEntries) {
+              setConfirmDialog({
+                title: '確認可能重複客戶',
+                message: `已找到相同姓名及聯絡資料的客戶「${matchingCustomer.fullName}」(${matchingCustomer.customerId})。仍要儲存這次更新嗎？`,
+                onConfirm: () => {
+                  setProfileEditData(prev => ({ ...prev, _allowDuplicateEntries: true }));
+                  setTimeout(() => document.getElementById('profile-edit-form')?.requestSubmit(), 0);
+                }
+              });
+              return;
             }
             const oldId = profileEditData.customerId;
             const upgrade = isTempId(oldId) && isValidPhone(newPhone);
@@ -2081,7 +2280,7 @@ const trafficChartData = useMemo(() => {
                 }
                 return prev.map((r, i) => {
                     if (!sameCustomerId(r.customerId, oldId)) return upgrade ? replaceReferralId(r, oldId, newId) : r;
-                    const updated = { ...r, customerId: newId, firstName: newFullName, lastName: '', name: newFullName, gender: (e.target as any).gender.value, language: (e.target as any).language.value, phone: newPhone, interests: profileEditData.interests.join(', '), marketingConsent: profileEditData.marketingConsent, consentTimestamp: timestampToSave };
+                    const updated = { ...r, customerId: newId, firstName: newFullName, lastName: '', name: newFullName, gender: (e.target as any).gender.value, language: (e.target as any).language.value, phone: newPhone, interests: profileEditData.interests.join(', '), profileMediaFiles: getMediaFiles(profileEditData, 'profileMediaFiles'), marketingConsent: profileEditData.marketingConsent, consentTimestamp: timestampToSave };
                     return i === stylistIdx ? { ...updated, stylist: newStylist } : updated;
                 });
             });
@@ -2099,6 +2298,20 @@ const trafficChartData = useMemo(() => {
                 </div>
               </div>
               <div><label className="block text-[10px] md:text-xs font-bold mb-1 text-gray-500">設計師 (Preferred Stylist)</label><select name="stylist" defaultValue={stylists.includes(profileEditData.preferredStylist) ? profileEditData.preferredStylist : 'Others'} className="w-full bg-[#F6EFE9] border-transparent focus:border-[#8B5A2B] border-2 rounded-xl py-2.5 md:py-3 px-2 font-bold outline-none text-sm md:text-base">{stylists.map(s => <option key={s} value={s}>{s}</option>)}</select></div>
+              <div className="border-t border-gray-100 pt-3">
+                <div className="flex justify-between items-center gap-2 mb-2">
+                  <label className="text-[10px] md:text-xs font-bold text-gray-500">客戶照片/影片 (Customer Media)</label>
+                  <button type="button" disabled={isUploadingPhoto} onClick={captureProfileMedia} className="px-3 py-2 rounded-lg bg-blue-50 text-blue-600 font-bold text-xs disabled:opacity-50">{isUploadingPhoto ? '上傳中...' : '+ 加入媒體'}</button>
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  {getMediaFiles(profileEditData, 'profileMediaFiles').map((file, index) => (
+                    <div key={`${file.url}-${index}`} className="relative">
+                      {file.type?.startsWith('video/') ? <video src={file.url} controls className="w-full h-20 object-cover rounded-lg" /> : <img src={file.url} alt={file.name || `Media ${index + 1}`} className="w-full h-20 object-cover rounded-lg" />}
+                      <button type="button" onClick={() => setProfileEditData(prev => removeMediaFile(prev, index, 'profileMediaFiles'))} className="absolute top-1 right-1 bg-red-600 text-white rounded-full px-2 py-0.5 text-xs font-bold">移除</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
               <div className="pt-2">
                   <label className="block text-[10px] md:text-xs font-bold mb-1.5 md:mb-2 text-gray-500">編輯標籤 (Customer Tags)</label>
                   <div className="flex flex-wrap gap-1.5 md:gap-2">
