@@ -121,10 +121,10 @@ const MENU_CATEGORIES = [
     title: '染髮 (Coloring)',
     icon: '🎨',
     items: [
-      { name: 'Root Touch Up (補染髮根)', price: 600 }, // Popular 1
-      { name: 'Single Color M (全頭染 中)', price: 750 }, // Popular 2
-      { name: 'Single Color S (全頭染 短)', price: 650 },
-      { name: 'Single Color L (全頭染 長)', price: 850 },
+      { name: 'Root Touch Up (補染髮根)', price: 680 }, // Popular 1
+      { name: 'Single Color M (全頭染 中)', price: 800 }, // Popular 2
+      { name: 'Single Color S (全頭染 短)', price: 700 },
+      { name: 'Single Color L (全頭染 長)', price: 900 },
       { name: 'Bleach S (漂染 短)', price: 850 },
       { name: 'Bleach M (漂染 中)', price: 1050 },
       { name: 'Balayage/Highlight (手掃/創意挑染)', price: 1400 },
